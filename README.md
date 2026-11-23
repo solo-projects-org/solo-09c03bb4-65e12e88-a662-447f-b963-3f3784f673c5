@@ -53,6 +53,50 @@ python scripts/demo.py --base-url http://127.0.0.1:8000
 - **待复算**：报告 `status` 变 `pending_recalc`，记录 `stale_at`、
   `stale_reasons`、`stale_segment_ids`；原快照字段不变，详情接口照常返回。
 
+## 停电复核（与换灯节电分开验收）
+
+整夜停电会拉低当天单灯读数，既可能虚增换灯节电（目标后段被压低），也可能
+压低结果（目标前段或对照后段被压低）。这部分**不进入核算式、不改报告数字**，
+由验收员单独复核。
+
+- **登记工单**：`POST /api/outage-orders`，字段 `order_no`（唯一）、`segment_id`、
+  `first_date`/`last_date`（日报日期，**含两端**）。工单可改期（`PATCH`：路段和/
+  或起止日）或撤回（`POST .../withdraw`）。撤回后不可再改。
+- **按报告号查命中的工单**：`GET /api/outage-orders?report_id=` 只返回起止区间
+  与该报告**实际用过的日报日期**（来自不可变报告快照，不是现行日报）有重叠、
+  且路段是报告目标或对照的工单。
+- **复核视图**：`GET /api/reports/{id}/outage-review` 列出命中的工单、命中的日期、
+  该路段在报告中的角色（`target`/`control`）、所属前后段（`before`/`after`）以及
+  当天读数与段均值。**逐日标方向**：若停电拉低当天读数，按原核算式
+  `净节电 = 目标减少量 − 对照平均减少量`，`effect_on_net_savings` 给出
+  `inflated`（虚增）或 `depressed`（压低）：
+  - 目标前段被压低 → 报告值偏低 → `depressed`
+  - 目标后段被压低 → 报告值偏高 → `inflated`
+  - 对照前段被压低 → 对照平均减少量偏大 → 报告值偏低 → `inflated`
+  - 对照后段被压低 → 对照平均减少量偏小 → 报告值偏高 → `depressed`
+- **确认**：`POST /api/reports/{id}/outage-review/confirm` 带 `reviewer` 和当前
+  `evidence_version`。证据在提交时已变（版本不匹配）→ `409` 拒绝。当前版本
+  已被确认过 → 不重复记录（`new_confirmation=false`，返回原确认）。
+- **回到待复核**：命中的工单或日期一改（改期、撤回，或新增/改到报告用过的
+  日期），确认即作废、状态回到 `pending`；**即使改回原样也不恢复确认**——每次
+  相关工单变更都会推进报告的 `epoch`，证据版本单调变化，旧确认永远对不上。
+- **留痕**：每次确认把当时证据（工单集合、日期、角色、逐日方向）连同证据版本
+  写入 SQLite（`outage_review_confirmations`），`confirmation_history` 可回查，
+  被作废的旧确认也不删除。
+- **隔离**：复核只读报告快照与工单，**不读现行日报**；`report_usage` 记录每份
+  报告用过的 (路段, 日期)，改工单通过其索引定位候选报告，**不逐份扫描历史报告**。
+  复核**不改**报告数字与状态（报告状态仍只由数据补正驱动）。
+
+### 演示（Swagger 同样可用）
+
+1. `POST /api/segments` 建目标 + 对照，`PUT .../readings` 补齐 14 天，`POST /api/reports?segment_id=` 出报告。
+2. `POST /api/outage-orders`：`{"order_no":"WO-1","segment_id":1,"first_date":"2026-03-11","last_date":"2026-03-11"}`。
+3. `GET /api/reports/1/outage-review` 查看命中工单、日期、角色与逐日 `inflated`/`depressed`。
+4. `POST /api/reports/1/outage-review/confirm`：`{"reviewer":"验收员","evidence_version":"<上一步返回>"}`。
+5. `PATCH /api/outage-orders/1` 改期 → 复核回到 `pending`；重复用旧版本确认 → `409`。
+
+`scripts/demo.py` 已串入上述查证、确认、改期三步。
+
 ## 并发正确性
 
 出报告和所有补正都使用 `BEGIN IMMEDIATE` 显式写事务。SQLite 会把两者串行化：
@@ -76,6 +120,13 @@ python scripts/demo.py --base-url http://127.0.0.1:8000
 | POST | `/api/reports?segment_id=` | 出报告（201）或暂缓（200 + `deferred` + reasons） |
 | GET | `/api/reports` | 报告列表，可按目标路段/状态筛选 |
 | GET | `/api/reports/{id}` | 报告详情（含快照、待复算原因） |
+| POST | `/api/outage-orders` | 登记停电工单（201），返回受影响复核 |
+| GET | `/api/outage-orders` | 工单列表，可按路段/状态/报告号筛选 |
+| GET | `/api/outage-orders/{id}` | 工单详情 |
+| PATCH | `/api/outage-orders/{id}` | 改期（路段和/或起止日） |
+| POST | `/api/outage-orders/{id}/withdraw` | 撤回工单 |
+| GET | `/api/reports/{id}/outage-review` | 停电复核证据（命中工单/日期/角色/逐日方向） |
+| POST | `/api/reports/{id}/outage-review/confirm` | 凭所见证据版本确认（证据已变则 409） |
 
 补正响应统一含：`changed`、`changed_readings`、`affected_reports`
 （`report_id` / `previous_status` / `status`）、`impact`（复核报告数、新标记数、
@@ -126,3 +177,8 @@ pytest -q
 净节电算术、目标缺数与无对照暂缓、报告快照不可变、换灯日/目标读数/对照读数/
 对照增减各类补正标记、只重读被改路段、重复补正不重复标记、重复日期 upsert、
 以及出报告与补正并发的交错场景。
+
+停电复核另见 `tests/test_outage.py`：只匹配报告实际用过的日期（改/删现行日报
+不影响命中）、按报告号查工单、目标/对照 × 前/后段四象限的虚增/压低方向、
+确认版本不符拒绝、当前版本重复确认不重记、改期/撤回/改回原样均回到待复核且旧
+确认留痕、复核不读日报也不改报告数字、改工单走 `report_usage` 索引而非全表扫描。

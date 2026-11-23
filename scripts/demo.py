@@ -123,6 +123,63 @@ def main() -> int:
         listing = client.get("/api/reports", params={"status": "pending_recalc"})
         listing.raise_for_status()
         print("pending_recalc reports:", [r["id"] for r in listing.json()])
+
+        # -- outage re-check ------------------------------------------------
+        order = client.post(
+            "/api/outage-orders",
+            json={
+                "order_no": f"WO-{suffix}",
+                "segment_id": target_id,
+                "first_date": "2026-03-11",
+                "last_date": "2026-03-11",
+            },
+        )
+        order.raise_for_status()
+        _show("outage order registered", order.json())
+
+        review = client.get(f"/api/reports/{report['id']}/outage-review")
+        review.raise_for_status()
+        review_body = review.json()
+        _show("outage review evidence", review_body)
+        assert review_body["status"] == "pending"
+        version = review_body["evidence_version"]
+        assert review_body["matched_orders"][0]["order_no"] == f"WO-{suffix}"
+        for day in review_body["impacted_days"]:
+            print(
+                "affected day:",
+                day["date"],
+                day["role"],
+                day["phase"],
+                "->",
+                day["effect_on_net_savings"],
+            )
+
+        confirmed = client.post(
+            f"/api/reports/{report['id']}/outage-review/confirm",
+            json={"reviewer": "验收员", "evidence_version": version},
+        )
+        confirmed.raise_for_status()
+        _show("outage review confirmed", confirmed.json())
+        repeated = client.post(
+            f"/api/reports/{report['id']}/outage-review/confirm",
+            json={"reviewer": "验收员", "evidence_version": version},
+        ).json()
+        assert repeated["new_confirmation"] is False, repeated
+        print("OK: repeat confirmation of the same evidence was not recorded again")
+
+        stale = client.patch(
+            f"/api/outage-orders/{order.json()['order']['id']}",
+            json={"first_date": "2026-03-12", "last_date": "2026-03-12"},
+        )
+        stale.raise_for_status()
+        _show("outage order rescheduled", stale.json())
+        after_reschedule = client.get(
+            f"/api/reports/{report['id']}/outage-review"
+        ).json()
+        assert after_reschedule["status"] == "pending", after_reschedule["status"]
+        assert after_reschedule["invalidated_reason"]["type"] == "outage_order_changed"
+        print("OK: confirmation invalidated by rescheduling; original evidence kept in history")
+        print("report unchanged:", after_reschedule["recomputed_report"] is False)
     return 0
 
 

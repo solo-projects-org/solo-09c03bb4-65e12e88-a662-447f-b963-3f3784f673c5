@@ -38,7 +38,6 @@ from .models import (
     ReadingPoint,
     ReportDetail,
     ReportIssueResult,
-    ReportSummary,
     TargetDetail,
 )
 
@@ -721,6 +720,19 @@ def issue_report(
             ),
         )
         report_id = int(cur.lastrowid)
+        # Freeze which (segment, day) pairs this report used so later outage
+        # order changes can find impacted reports by index instead of scanning
+        # report snapshots.
+        usage_pairs = [(report_id, segment_id, "target", str(d)) for d in dates]
+        for control in controls:
+            usage_pairs.extend(
+                (report_id, control["id"], "control", str(d)) for d in dates
+            )
+        conn.executemany(
+            "INSERT OR IGNORE INTO report_usage "
+            "(report_id, segment_id, role, reading_date) VALUES (?, ?, ?, ?)",
+            usage_pairs,
+        )
         report = _report_detail(conn, report_id)
         return ReportIssueResult(
             status="issued",

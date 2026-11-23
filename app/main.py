@@ -7,12 +7,19 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import __version__, service
+from . import __version__, outage, service
 from .config import Settings, load_settings
 from .db import Database
 from .models import (
     CorrectionResult,
     HealthOut,
+    OutageOrderCreate,
+    OutageOrderMutationResult,
+    OutageOrderOut,
+    OutageOrderPatch,
+    OutageReviewConfirm,
+    OutageReviewConfirmResult,
+    OutageReviewState,
     ReadingsOut,
     ReadingsUpsert,
     ReportDetail,
@@ -185,6 +192,110 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/reports/{report_id}", response_model=ReportDetail, tags=["reports"])
     def get_report(report_id: int, database: DbDep) -> ReportDetail:
         return ReportDetail(**service.get_report(database, report_id))
+
+    # -- outage re-check --------------------------------------------------
+
+    @app.post(
+        "/api/outage-orders",
+        response_model=OutageOrderMutationResult,
+        status_code=201,
+        tags=["outage"],
+        summary="Register an outage work order (order_no + segment + inclusive dates)",
+    )
+    def create_outage_order(
+        payload: OutageOrderCreate, database: DbDep
+    ) -> OutageOrderMutationResult:
+        return OutageOrderMutationResult(**outage.create_order(database, payload))
+
+    @app.get(
+        "/api/outage-orders",
+        response_model=list[OutageOrderOut],
+        tags=["outage"],
+        summary="List outage orders (filter by segment / status / report)",
+    )
+    def list_outage_orders(
+        database: DbDep,
+        segment_id: int | None = None,
+        status: str | None = Query(default=None, pattern="^(active|withdrawn)$"),
+        report_id: int | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> list[OutageOrderOut]:
+        return [
+            OutageOrderOut(**o)
+            for o in outage.list_orders(
+                database,
+                segment_id=segment_id,
+                status=status,
+                report_id=report_id,
+                limit=limit,
+                offset=offset,
+            )
+        ]
+
+    @app.get(
+        "/api/outage-orders/{order_id}",
+        response_model=OutageOrderOut,
+        tags=["outage"],
+    )
+    def get_outage_order(order_id: int, database: DbDep) -> OutageOrderOut:
+        return OutageOrderOut(**outage.get_order(database, order_id))
+
+    @app.patch(
+        "/api/outage-orders/{order_id}",
+        response_model=OutageOrderMutationResult,
+        tags=["outage"],
+        summary="Reschedule an outage order (segment and/or inclusive dates)",
+    )
+    def patch_outage_order(
+        order_id: int, payload: OutageOrderPatch, database: DbDep
+    ) -> OutageOrderMutationResult:
+        return OutageOrderMutationResult(
+            **outage.patch_order(database, order_id, payload)
+        )
+
+    @app.post(
+        "/api/outage-orders/{order_id}/withdraw",
+        response_model=OutageOrderMutationResult,
+        tags=["outage"],
+        summary="Withdraw an outage order",
+    )
+    def withdraw_outage_order(
+        order_id: int, database: DbDep
+    ) -> OutageOrderMutationResult:
+        return OutageOrderMutationResult(**outage.withdraw_order(database, order_id))
+
+    @app.get(
+        "/api/reports/{report_id}/outage-review",
+        response_model=OutageReviewState,
+        tags=["outage"],
+        summary="Evidence for reviewing a report against outage orders",
+    )
+    def get_outage_review(report_id: int, database: DbDep) -> OutageReviewState:
+        return OutageReviewState(**outage.get_review(database, report_id))
+
+    @app.post(
+        "/api/reports/{report_id}/outage-review/confirm",
+        response_model=OutageReviewConfirmResult,
+        tags=["outage"],
+        summary="Confirm the outage review for the exact evidence version seen",
+        responses={
+            409: {
+                "description": (
+                    "Evidence changed since it was viewed; reload the review "
+                    "and confirm again"
+                )
+            }
+        },
+    )
+    def confirm_outage_review(
+        report_id: int, payload: OutageReviewConfirm, database: DbDep
+    ) -> OutageReviewConfirmResult:
+        return OutageReviewConfirmResult(
+            **outage.confirm_review(
+                database, report_id, payload.reviewer, payload.evidence_version
+            )
+        )
 
     return app
 
